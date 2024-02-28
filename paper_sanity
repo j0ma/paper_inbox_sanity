@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+
+# paper_sanity
+# ------------
+#
+# Bash tool to manage the metric ton of papers that I have open :) 
+#
+# User interface
+# --------------
+# 1. `fill_inbox` moves currently open papers to inbox folder
+# 2. `process_papers_in_inbox`: iterates through papers currently in inbox and processes them
+#   * 
+#
+# Inbox structure
+# --------------
+# * Simple folder with one subfolder per open PDFs
+# * In the subfolder, we have the following
+#   * Original paper file
+#   * Comments file: comments.txt
+#   * Symlink to paper: paper.pdf
+
+set -euo pipefail
+
+export debug_mode=${debug_mode:-no}
+export pdf_editor=${pdf_editor:-zathura}
+export papers_inbox_folder=${papers_inbox_folder:-~/papers_inbox}
+
+[ "${debug_mode}" = "yes" ] && set -x
+
+AVAILABLE_COMMANDS=(
+    "interactive"
+    "fill"
+    "list"
+    "tree"
+    "view_metadata"
+    "view_paper"
+    "process"
+    "empty"
+)
+ACTIONS=("comment" "add_to_library" "delete"  "exit")
+
+## HELPER FUNCTIONS
+
+get_pdf_editor_pids () {
+    pgrep ${pdf_editor}
+}
+
+get_pdf_filename_given_pid () {
+    local pid=${1}
+    xargs -0 printf '%s\n' < /proc/${pid}/cmdline | tail -n1
+}
+
+
+export -f get_pdf_editor_pids
+export -f get_pdf_filename_given_pid
+
+find_open_papers () {
+    get_pdf_editor_pids | parallel get_pdf_filename_given_pid   
+}
+
+## COMMAND FUNCTIONS
+
+fill_inbox () {
+
+    # First copy all the relevant papers to the inbox folder
+    for open_paper in $(find_open_papers)
+    do
+        local paper_file_name=$(basename ${open_paper})
+        if [ -z "${paper_file_name}" ]; then
+            continue
+        fi
+
+        local new_paper_folder_name=$(echo ${paper_file_name} | sed "s/.pdf$//g")
+        local new_paper_folder_path=${papers_inbox_folder}/${new_paper_folder_name}
+        mkdir -p ${new_paper_folder_path}
+        cp -v ${open_paper} ${new_paper_folder_path}/${paper_file_name}
+        ln -s ${new_paper_folder_path}/${paper_file_name} ${new_paper_folder_path}/paper.pdf
+    done
+
+    # Then kill all the open PDF viewers
+    get_pdf_editor_pids | xargs kill -9
+}
+
+list_papers_in_inbox () {
+    local action=${1:-"list"}
+    case ${action} in
+        list)
+            find ${papers_inbox_folder} -mindepth 1 -type d | cat -n | sed 's/^\s*//g'
+            ;;
+        tree)
+            tree ${papers_inbox_folder}
+            ;;
+    esac
+}
+
+interactive_process_papers_in_inbox () {
+    paper_folder=$(gum choose --header "Pick paper:" $(list_papers_in_inbox))
+}
+
+
+add_from_acl () {
+    local acl_url=${1}
+    local url_no_pdf=$(echo "$1" | sed "s/\.pdf$//g" | sed "s/\/$//g");
+
+    local pdf_url="${url_no_pdf}.pdf";
+    local bib_url="${url_no_pdf}.bib";
+
+    local uuid=$(uuid);
+    local uuid_folder="/tmp/${uuid}";
+
+    mkdir -p $uuid_folder;
+    pushd $uuid_folder;
+
+    local temp_paper=$(date +%s).pdf;
+    local temp_bib=$(date +%s).bib;
+
+    wget -q -o "${temp_paper}" "${pdf_url}";
+    wget -q -o "${temp_bib}" "${bib_url}";
+
+    papis add --from bibtex "${temp_bib}" "${temp_paper}";
+
+    popd;
+
+    rm -rf $uuid_folder
+}
+
+add_from_arxiv () { 
+    local pdf_url=$1;
+    local arxiv_uri=$(basename ${pdf_url//.pdf/});
+    papis add --no-confirm --from arxiv "https://arxiv.org/abs/$arxiv_uri"
+}
+
+add_from_bibtex () {
+
+    paper_pdf=$1
+    paper_bib=$2
+    
+    papis add ${paper_pdf} --from bibtex ${paper_bib}
+
+}
+
+process_all_papers_in_inbox () {
+    paper_indices=$(list_papers_in_inbox | cut -f1)
+    for paper_index in ${paper_indices}; do
+        process_paper_in_inbox ${paper_index}
+    done
+}
+
+process_some_papers_in_inbox () {
+    while true
+    do 
+        paper_index=$(gum choose --header "Pick paper:" $(list_papers_in_inbox | cut -f1))
+        if [ "${paper_index}" = "exit" ]; then
+            break
+        fi
+        process_paper_in_inbox ${paper_index}
+    done
+}
+
+process_paper_in_inbox () {
+
+    local paper_index=$1
+    local paper_folder=$(get_paper_folder_by_idx ${paper_index})
+    local action=$(gum choose --header "Pick action:" ${ACTIONS[@]})
+    case ${action} in
+        delete)
+            ${pdf_editor} ${paper_folder}/paper.pdf
+            gum confirm "Delete paper? ${paper_folder}/paper.pdf" && rm -rfv ${paper_folder}
+            ;;
+        comment)
+            local comments_file=${paper_folder}/comments.txt
+            touch ${comments_file}
+            ${EDITOR} ${comments_file}
+            ;;
+        add_to_library)
+            how_to_add=$(gum choose --header "How to add to library?" "Arxiv" "ACL" "Bibtex")
+            case ${how_to_add} in
+                Arxiv)
+                    local arxiv_uri=$(gum input --placeholder "Arxiv URI:")
+                    add_from_arxiv ${arxiv_uri}
+                    ;;
+                ACL)
+                    local acl_uri=$(gum input --placeholder "ACL URI:")
+                    add_from_acl ${acl_uri}
+                    ;;
+                Bibtex)
+                    how_to_add_bib=$(gum choose --header "Bibtex ingestion method:" "Paste" "File")
+                    case ${how_to_add_bib} in
+                        Paste)
+                            local bib_file=${paper_folder}/paper.bib
+                            echo "# Paste .bib file here" | vipe | rg -v "^#" > ${bib_file}
+                            ;;
+                        File)
+                            local old_bib_file=$(gum file)
+                            local bib_file=${paper_folder}/paper.bib
+                            cp ${old_bib_file} ${bib_file}
+                            ;;
+                    esac
+
+                    add_from_bibtex $(realpath ${paper_folder}/paper.pdf) ${bib_file}
+                    ;;
+            esac
+            gum confirm "Delete paper? ${paper_folder}/paper.pdf" && rm -rfv ${paper_folder}
+            ;;
+        *)
+            echo "Invalid action: ${action}"
+            ;;
+    esac
+    
+}
+
+process_papers_in_inbox () {
+    local process_this=${1:-""}
+    case ${process_this} in
+        "")
+            echo "ERROR: process_papers_in_inbox requires an argument"
+            ;;
+        all)
+            process_all_papers_in_inbox
+            ;;
+        some)
+            process_some_papers_in_inbox
+            ;;
+        *)
+            process_paper_in_inbox ${process_this}
+            ;;
+    esac
+}
+
+get_paper_folder_by_idx () {
+    local paper_index=$1
+    local paper_folder=$(list_papers_in_inbox | sed -n "${paper_index}p" | cut -f2)
+    echo ${paper_folder}
+}
+
+view_metadata () {
+    local paper_folder=$(get_paper_folder_by_idx ${1})
+    tree ${paper_folder}
+}
+
+view_paper () {
+    local paper_folder=$(get_paper_folder_by_idx ${1})
+    ${pdf_editor} $(realpath ${paper_folder}/paper.pdf) 2>&1 > /dev/null &
+}
+
+nuke_inbox () {
+    gum confirm "Empty inbox?" && rm -vrf ${papers_inbox_folder}/*
+}
+
+## UI / MAIN FUNCTIONS
+
+
+usage () {
+    gum style \
+	--foreground 212 --border-foreground 212 --border double \
+	--width 80 --margin "1 2" --padding "2 4" \
+    "Usage: paper_sanity <command>" \
+    "Commands:" \
+    $(parallel echo "  {}" ::: ${AVAILABLE_COMMANDS[@]})
+}
+
+run_interactive_loop () {
+
+    local command=""
+    while [ "${command}" != "exit" ]; do
+        command=$(gum choose --header "Choose a command: " ${AVAILABLE_COMMANDS[@]} "exit")
+        if [[ " ${AVAILABLE_COMMANDS[@]} " =~ " ${command} " ]]; then
+            main ${command}
+        elif [ "${command}" != "exit" ]; then
+            echo "Invalid command"
+        fi
+    done
+
+}
+
+main () {
+
+    # Grab first arg as command if there were any
+    local command=${1}
+
+    # Shift args to get the rest
+    [ $# -gt 1 ] && shift
+    local rest=$@
+
+    case ${command} in
+        interactive|interactive_loop)
+            run_interactive_loop
+            ;;
+        fill|fill_inbox)
+            fill_inbox
+            ;;
+        list|list_papers_in_inbox)
+            list_papers_in_inbox list
+            ;;
+        tree)
+            list_papers_in_inbox tree
+            ;;
+        process|process_papers_in_inbox)
+            process_papers_in_inbox $@
+            ;;
+        empty|empty_inbox)
+            nuke_inbox
+            ;;
+        view)
+            subcmd=${1}
+            shift
+            main view_${subcmd} $@
+            ;;
+        view_metadata|view_meta|meta)
+            view_metadata $1
+            ;;
+        view_paper|view_pdf|pdf)
+            view_paper $1
+            ;;
+        *)
+            usage
+            ;;
+    esac
+}
+
+main $@
