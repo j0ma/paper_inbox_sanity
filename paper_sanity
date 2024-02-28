@@ -5,12 +5,6 @@
 #
 # Bash tool to manage the metric ton of papers that I have open :) 
 #
-# User interface
-# --------------
-# 1. `fill_inbox` moves currently open papers to inbox folder
-# 2. `process_papers_in_inbox`: iterates through papers currently in inbox and processes them
-#   * 
-#
 # Inbox structure
 # --------------
 # * Simple folder with one subfolder per open PDFs
